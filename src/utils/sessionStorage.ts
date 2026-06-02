@@ -34,7 +34,7 @@ import { builtInCommandNames } from '../commands.js'
 import { COMMAND_NAME_TAG, TICK_TAG } from '../constants/xml.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
 import * as sessionIngress from '../services/api/sessionIngress.js'
-import { REPL_TOOL_NAME } from '../tools/REPLTool/constants.js'
+import { REPL_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/REPLTool/constants.js'
 import {
   type AgentId,
   asAgentId,
@@ -529,6 +529,10 @@ export function setRemoteIngressUrlForTesting(url: string): void {
 
 const REMOTE_FLUSH_INTERVAL_MS = 10
 
+// Limit the number of cached session-file lookups to prevent unbounded Map growth
+// in long-running daemon / swarm sessions that spawn many sub-agents.
+const MAX_CACHED_SESSION_FILES = 200
+
 class Project {
   // Minimal cache for current session only (not all sessions)
   currentSessionTag: string | undefined
@@ -577,6 +581,7 @@ class Project {
     this.flushTimer = null
     this.activeDrain = null
     this.writeQueues = new Map()
+    this.existingSessionFiles = new Map()
   }
 
   private incrementPendingWrites(): void {
@@ -609,6 +614,13 @@ class Project {
       if (!queue) {
         queue = []
         this.writeQueues.set(filePath, queue)
+      }
+      // Drop oldest entries when queue exceeds limit to prevent unbounded memory growth
+      if (queue.length >= 1000) {
+        const dropped = queue.splice(0, queue.length - 999)
+        for (const d of dropped) {
+          d.resolve()
+        }
       }
       queue.push({ entry, resolve })
       this.scheduleDrain()
@@ -1281,6 +1293,9 @@ class Project {
    * Returns the session file path if it exists, null otherwise.
    * Used for writing to sessions other than the current one.
    * Caches positive results so we only stat once per session.
+   *
+   * The cache is bounded at MAX_CACHED_SESSION_FILES to prevent unbounded
+   * growth in long-running daemon / swarm sessions that spawn many agents.
    */
   private existingSessionFiles = new Map<string, string>()
   private async getExistingSessionFile(
@@ -1292,6 +1307,13 @@ class Project {
     const targetFile = getTranscriptPathForSession(sessionId)
     try {
       await stat(targetFile)
+      // Evict oldest entry when at capacity so the Map stays bounded
+      if (this.existingSessionFiles.size >= MAX_CACHED_SESSION_FILES) {
+        const oldestKey = this.existingSessionFiles.keys().next().value
+        if (oldestKey !== undefined) {
+          this.existingSessionFiles.delete(oldestKey)
+        }
+      }
       this.existingSessionFiles.set(sessionId, targetFile)
       return targetFile
     } catch (e) {
@@ -1927,9 +1949,9 @@ function applyPreservedSegmentRelinks(
       messages.set(uuid, {
         ...msg,
         message: {
-          ...msg.message,
+          ...msg.message!,
           usage: {
-            ...msg.message.usage,
+            ...msg.message!.usage,
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -2131,7 +2153,7 @@ function recoverOrphanedParallelToolResults(
   // already in chain order, so later iterations overwrite → last wins.
   const anchorByMsgId = new Map<string, ChainAssistant>()
   for (const a of chainAssistants) {
-    if (a.message.id) anchorByMsgId.set(a.message.id, a)
+    if (a.message!.id) anchorByMsgId.set(a.message!.id, a)
   }
 
   // O(n) precompute: sibling groups and TR index.
@@ -2140,15 +2162,17 @@ function recoverOrphanedParallelToolResults(
   const siblingsByMsgId = new Map<string, TranscriptMessage[]>()
   const toolResultsByAsst = new Map<UUID, TranscriptMessage[]>()
   for (const m of messages.values()) {
-    if (m.type === 'assistant' && m.message.id) {
-      const group = siblingsByMsgId.get(m.message.id)
+    if (m.type === 'assistant' && m.message!.id) {
+      const group = siblingsByMsgId.get(m.message!.id)
       if (group) group.push(m)
-      else siblingsByMsgId.set(m.message.id, [m])
+      else siblingsByMsgId.set(m.message!.id, [m])
     } else if (
       m.type === 'user' &&
       m.parentUuid &&
-      Array.isArray(m.message.content) &&
-      m.message.content.some(b => b.type === 'tool_result')
+      Array.isArray(m.message!.content) &&
+      (m.message!.content as Array<{ type: string }>).some(
+        b => b.type === 'tool_result',
+      )
     ) {
       const group = toolResultsByAsst.get(m.parentUuid)
       if (group) group.push(m)
@@ -2164,7 +2188,7 @@ function recoverOrphanedParallelToolResults(
   const inserts = new Map<UUID, TranscriptMessage[]>()
   let recoveredCount = 0
   for (const asst of chainAssistants) {
-    const msgId = asst.message.id
+    const msgId = asst.message!.id
     if (!msgId || processedGroups.has(msgId)) continue
     processedGroups.add(msgId)
 
@@ -4357,7 +4381,7 @@ export function isLoggableMessage(m: Message): boolean {
   // user-configured hook output that is useful for session context on resume.
   if (m.type === 'attachment' && getUserType() !== 'ant') {
     if (
-      m.attachment.type === 'hook_additional_context' &&
+      m.attachment!.type === 'hook_additional_context' &&
       isEnvTruthy(process.env.CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT)
     ) {
       return true
@@ -4370,8 +4394,12 @@ export function isLoggableMessage(m: Message): boolean {
 function collectReplIds(messages: readonly Message[]): Set<string> {
   const ids = new Set<string>()
   for (const m of messages) {
-    if (m.type === 'assistant' && Array.isArray(m.message.content)) {
-      for (const b of m.message.content) {
+    if (m.type === 'assistant' && Array.isArray(m.message!.content)) {
+      for (const b of m.message!.content as Array<{
+        type: string
+        name: string
+        id: string
+      }>) {
         if (b.type === 'tool_use' && b.name === REPL_TOOL_NAME) {
           ids.add(b.id)
         }
@@ -4488,9 +4516,9 @@ export async function findUnresolvedToolUse(
     // Find the tool use but make sure there's not also a result
     for (const message of messages.values()) {
       if (message.type === 'assistant') {
-        const content = message.message.content
+        const content = message.message!.content
         if (Array.isArray(content)) {
-          for (const block of content) {
+          for (const block of content as Array<{ type: string; id: string }>) {
             if (block.type === 'tool_use' && block.id === toolUseId) {
               toolUseMessage = message
               break
@@ -4498,9 +4526,12 @@ export async function findUnresolvedToolUse(
           }
         }
       } else if (message.type === 'user') {
-        const content = message.message.content
+        const content = message.message!.content
         if (Array.isArray(content)) {
-          for (const block of content) {
+          for (const block of content as Array<{
+            type: string
+            tool_use_id: string
+          }>) {
             if (
               block.type === 'tool_result' &&
               block.tool_use_id === toolUseId
@@ -4513,7 +4544,7 @@ export async function findUnresolvedToolUse(
       }
     }
 
-    return toolUseMessage
+    return toolUseMessage as AssistantMessage | null
   } catch {
     return null
   }
@@ -4900,9 +4931,7 @@ function extractFirstPromptFromChunk(chunk: string): string {
         }
         return result
       }
-    } catch {
-      continue
-    }
+    } catch {}
   }
   // Session started with a slash command but had no subsequent real message —
   // use the clean command name so the session still appears in the resume picker
